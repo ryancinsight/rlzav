@@ -1,0 +1,23 @@
+[package]
+name = "lzav"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Rust implementation of LZAV compression algorithm"
+license = "MIT"
+repository = "https://github.com/yourusername/lzav-rs"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+
+[[bench]]
+name = "compression_benchmark"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
