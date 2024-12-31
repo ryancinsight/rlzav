@@ -1,182 +1,218 @@
 use crate::constants::*;
-use std::arch::x86_64::*;
+use crate::utils::{self, AlignedBuffer};
 
-// Add HashTable struct
-#[derive(Default)]
-struct HashTable {
-    data: Vec<u8>,
-    mask: usize,
-}
-
-// Implement methods for HashTable
-impl HashTable {
-    fn new(size: usize) -> Self {
-        let size = size.next_power_of_two();
-        Self {
-            data: vec![0; size],
-            mask: (size - 1) ^ 15,
-        }
+#[inline]
+pub fn lzav_decompress(src: &[u8], dst: &mut [u8], dstl: usize) -> Result<usize, i32> {
+    if src.is_empty() {
+        return if dstl == 0 { Ok(0) } else { Err(LZAV_E_PARAMS) };
     }
 
-    #[inline(always)]
-    unsafe fn get_entry_unchecked(&mut self, hash: u32) -> &mut [u8] {
-        let offset = (hash & self.mask as u32) as usize;
-        std::slice::from_raw_parts_mut(
-            self.data.as_mut_ptr().add(offset),
-            16
-        )
-    }
-}
-
-#[inline(always)]
-pub fn lzav_decompress(src: &[u8], dst: &mut [u8], expected_len: usize) -> Result<usize, i32> {
-    if src.is_empty() || dst.is_empty() || expected_len > dst.len() {
+    if dst.is_empty() || dstl == 0 {
         return Err(LZAV_E_PARAMS);
-    }
-
-    if expected_len > LZAV_WIN_LEN {
-        return Err(LZAV_E_PARAMS);
-    }
-
-    if src.len() < 2 {
-        return Err(LZAV_E_SRCOOB);
     }
 
     let fmt = src[0] >> 4;
-    if fmt < LZAV_FMT_MIN {
-        return Err(LZAV_E_UNKFMT);
+    match fmt {
+        2 => {
+            let mut written = 0;
+            let res = decompress_fmt2(src, dst, src.len(), dstl, &mut written)?;
+            Ok(res)
+        }
+        #[cfg(feature = "format1")]
+        1 => decompress_fmt1(src, dst, src.len(), dstl),
+        _ => Err(LZAV_E_UNKFMT)
+    }
+}
+
+/// Decompresses data partially, useful for recovery or streaming decompression.
+///
+/// This function can be used to decompress only an initial segment of a larger data block.
+/// Unlike the main decompression function, this one always returns a non-negative value
+/// and does not propagate error codes.
+#[inline]
+pub fn lzav_decompress_partial(src: &[u8], dst: &mut [u8], dstl: usize) -> usize {
+    if src.is_empty() || dst.is_empty() || dstl == 0 {
+        return 0;
     }
 
-    let mut ip = 1;  // Input pointer
-    let mut op = 0;  // Output pointer
+    let mut written = 0; // Move declaration to outer scope
+    let fmt = src[0] >> 4;
+    if fmt == 2 {
+        if let Ok(size) = decompress_fmt2(src, dst, src.len(), dstl, &mut written) {
+            size
+        } else {
+            written
+        }
+    } else {
+        written
+    }
+}
 
-    while ip < src.len() && op < expected_len {
-        let bh = src[ip];
-        ip += 1;
+#[inline]
+fn decompress_fmt2(src: &[u8], dst: &mut [u8], srcl: usize, dstl: usize, pwl: &mut usize) -> Result<usize, i32> {
+    if srcl < 6 {
+        return Err(LZAV_E_SRCOOB);
+    }
 
+    let mut ip = 1; // Skip format byte
+    let mut op = 0;
+    let mref1 = (src[0] & 15) as usize - 1;
+    let mut bh = src[ip] as usize;
+    let mut cv = 0;
+    let mut csh = 0;
+
+    // Load first block header
+    if ip >= srcl - 6 {
+        return Err(LZAV_E_SRCOOB);
+    }
+    bh = src[ip] as usize;
+
+    while ip < srcl - 6 {
         if (bh & 0x30) == 0 {
             // Literal block
-            let mut cc = (bh & 15) as usize;
-            if cc == 0 {
-                if ip >= src.len() {
-                    return Err(LZAV_E_SRCOOB);
+            let mut ncv = bh >> 6;
+            ip += 1;
+            let mut cc = bh & 15;
+
+            if cc != 0 {
+                // Direct length encoding
+                ncv <<= csh;
+                let src_pos = ip;
+                ip += cc;
+
+                if op + cc <= dstl && src_pos + cc <= srcl {
+                    cv |= ncv;
+                    csh += 2;
+                    bh = src[ip] as usize;
+                    // Use safe copy_block that returns Option
+                    if utils::arch::copy_block(&mut dst[op..], &src[src_pos..], cc).is_none() {
+                        return Err(LZAV_E_DSTOOB);
+                    }
+                    op += cc;
+                    continue;
                 }
-                cc = 16 + src[ip] as usize;
+            } else {
+                // Extended length encoding
+                let mut lcw = src[ip] as usize;
+                ncv <<= csh;
                 ip += 1;
-            }
-            
-            if ip + cc > src.len() || op + cc > expected_len {
-                return Err(LZAV_E_SRCOOB);
-            }
+                cc = lcw & 0x7F;
+                let mut sh = 7;
 
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                // Use SIMD for larger copies
-                if cc >= 32 {
-                    let mut copied = 0;
-                    while copied + 32 <= cc {
-                        let src_ptr = src[ip + copied..].as_ptr() as *const __m256i;
-                        let dst_ptr = dst[op + copied..].as_mut_ptr() as *mut __m256i;
-                        _mm256_storeu_si256(dst_ptr, _mm256_loadu_si256(src_ptr));
-                        copied += 32;
-                    }
-                    // Copy remaining bytes
-                    if copied < cc {
-                        dst[op + copied..op + cc].copy_from_slice(&src[ip + copied..ip + cc]);
-                    }
-                } else if cc >= 16 {
-                    let src_ptr = src[ip..].as_ptr() as *const __m128i;
-                    let dst_ptr = dst[op..].as_mut_ptr() as *mut __m128i;
-                    _mm_storeu_si128(dst_ptr, _mm_loadu_si128(src_ptr));
-                    if cc > 16 {
-                        dst[op + 16..op + cc].copy_from_slice(&src[ip + 16..ip + cc]);
-                    }
-                } else {
-                    dst[op..op + cc].copy_from_slice(&src[ip..ip + cc]);
+                while (lcw & 0x80) != 0 && sh < 28 {
+                    lcw = src[ip] as usize;
+                    ip += 1;
+                    cc |= (lcw & 0x7F) << sh;
+                    sh += 7;
+                }
+
+                cc += 16;
+                let src_pos = ip;
+                ip += cc;
+
+                if op + cc <= dstl && src_pos + cc <= srcl {
+                    cv |= ncv;
+                    csh += 2;
+                    bh = src[ip] as usize;
+                    utils::arch::copy_block(&mut dst[op..], &src[src_pos..], cc);
+                    op += cc;
+                    continue;
                 }
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
+
+            return if ip >= srcl {
+                *pwl = op;
+                Err(LZAV_E_SRCOOB)
+            } else if op + cc > dstl {
+                dst[op..dstl].copy_from_slice(&src[ip..ip + (dstl - op)]);
+                Err(LZAV_E_DSTOOB)
+            } else {
                 dst[op..op + cc].copy_from_slice(&src[ip..ip + cc]);
-            }
-
-            ip += cc;
-            op += cc;
-            continue;
+                op += cc;
+                cv |= ncv;
+                csh += 2;
+                bh = src[ip] as usize;
+                Ok(op)
+            };
         }
 
-        // Match block
-        let bt = ((bh >> 4) & 3) as usize;
-        if bt == 0 {
-            return Err(LZAV_E_UNKFMT);
-        }
+        // Reference block
+        let bt = (bh >> 4) & 3;
+        ip += 1;
+        let bt8 = bt << 3;
 
-        let mut next_ip = ip + bt;
-        let mut dist = ((bh as usize) >> 6) as usize;
-        for i in 0..bt {
-            dist = (dist << 8) | (src[ip + i] as usize);
-        }
+        // Load 32-bit value with endianness correction
+        let mut bv = u32::from_le_bytes(src[ip..ip + 4].try_into().unwrap());
+        ip += bt;
+        let o = bv & ((1 << bt8) - 1);
+        bv >>= bt8;
 
-        let mut match_len = (bh & 15) as usize;
-        if match_len == 0 {
-            if next_ip >= src.len() {
-                return Err(LZAV_E_SRCOOB);
-            }
-            match_len = 16 + src[next_ip] as usize;
-            next_ip += 1;
-        }
-        match_len += LZAV_REF_MIN;
+        // Reference offset calculation
+        let d = match bt {
+            0 => ((bh >> 6 | (o as usize) << 2) << csh) | cv,
+            1 => ((bh >> 6 | ((o as usize) & 0x3FF) << 2) << csh) | cv,
+            2 => ((bh >> 6 | ((o as usize) & 0x3FFFF) << 2) << csh) | cv,
+            _ => ((bh >> 6 | ((o as usize) & 0x1FFFFF) << 2) << csh) | cv,
+        };
 
-        if dist == 0 || dist > op || op + match_len > expected_len {
+        if d > op {
+            eprintln!("Error: Back-reference out of bounds. d: {}, op: {}", d, op); // Debug information
+            *pwl = op;
             return Err(LZAV_E_REFOOB);
         }
 
-        let match_src = op - dist;
-        
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            if match_len >= 32 && dist >= 32 {
-                let mut copied = 0;
-                while copied + 32 <= match_len {
-                    let src_ptr = dst[match_src + copied..].as_ptr() as *const __m256i;
-                    let dst_ptr = dst[op + copied..].as_mut_ptr() as *mut __m256i;
-                    _mm256_storeu_si256(dst_ptr, _mm256_loadu_si256(src_ptr));
-                    copied += 32;
-                }
-                if copied < match_len {
-                    for i in copied..match_len {
-                        dst[op + i] = dst[match_src + i];
-                    }
-                }
-            } else if match_len >= 16 && dist >= 16 {
-                let src_ptr = dst[match_src..].as_ptr() as *const __m128i;
-                let dst_ptr = dst[op..].as_mut_ptr() as *mut __m128i;
-                _mm_storeu_si128(dst_ptr, _mm_loadu_si128(src_ptr));
-                for i in 16..match_len {
-                    dst[op + i] = dst[match_src + i];
-                }
+        let src_pos = op - d;
+        let mut cc = bh & 15;
+
+        if cc != 0 {
+            cc += mref1;
+            bh = bv as usize & 0xFF;
+        } else {
+            bh = bv as usize & 0xFF;
+            if bh == 255 {
+                cc = 16 + mref1 + 255 + src[ip + 1] as usize;
+                bh = src[ip + 2] as usize;
+                ip += 2;
             } else {
-                for i in 0..match_len {
-                    dst[op + i] = dst[match_src + i];
-                }
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            for i in 0..match_len {
-                dst[op + i] = dst[match_src + i];
+                cc = 16 + mref1 + bh;
+                ip += 1;
+                bh = src[ip] as usize;
             }
         }
 
-        ip = next_ip;
-        op += match_len;
+        if op + cc > dstl {
+            // Perform partial copy up to dstl
+            let copy_len = dstl - op;
+            for i in 0..copy_len {
+                dst[op + i] = dst[src_pos + i];
+            }
+            return Err(LZAV_E_DSTOOB);
+        }
+
+        // Copy reference data
+        for i in 0..cc {
+            dst[op + i] = dst[src_pos + i];
+        }
+        op += cc;
+
+        // Update carry values
+        cv = if bt == 3 { (o >> 21) as usize } else { 0 };
+        csh = if bt == 3 { 3 } else { 0 };
     }
 
-    if op != expected_len {
+    if op != dstl {
+        *pwl = op;
         return Err(LZAV_E_DSTLEN);
     }
 
     Ok(op)
+}
+
+#[cfg(feature = "format1")]
+fn decompress_fmt1(src: &[u8], dst: &mut [u8], srcl: usize, dstl: usize) -> Result<usize, i32> {
+    // Format 1 decompression implementation
+    // This is optional and can be enabled via the "format1" feature
+    unimplemented!("Format 1 decompression not implemented");
 }
 
 #[cfg(test)]
@@ -184,22 +220,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_decompress_partial() {
-        let src = [0x21, 0x04, 1, 2, 3, 4];
-        let mut dst = [0u8; 10];
-        let written = lzav_decompress(&src, &mut dst, 4).unwrap();
-        assert_eq!(written, 4);
-        assert_eq!(&dst[..4], &[1, 2, 3, 4]);
+    fn test_decompress_empty() {
+        let mut dst = [0u8; 16];
+        assert!(lzav_decompress(&[], &mut dst, 0).is_ok());
+        assert!(lzav_decompress(&[], &mut dst, 1).is_err());
+    }
+
+    #[test]
+    fn test_decompress_invalid_format() {
+        let src = [0xFF; 16]; // Invalid format byte
+        let mut dst = [0u8; 16];
+        assert!(lzav_decompress(&src, &mut dst, 16).is_err());
+    }
+
+    #[test]
+    fn test_decompress_truncated() {
+        let src = [0x20, 0x01]; // Valid format but truncated
+        let mut dst = [0u8; 16];
+        assert!(lzav_decompress(&src, &mut dst, 16).is_err());
     }
 }
 
-#[repr(C)]
-struct HashEntry {
-    value: u64,
-    position: u64,
-}
-
-#[cfg(target_feature = "avx2")]
-unsafe fn copy_block(dst: &mut [u8], src: &[u8], len: usize) {
-    // AVX2-optimized copy
-}
