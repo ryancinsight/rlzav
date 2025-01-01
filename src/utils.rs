@@ -1,5 +1,3 @@
-use crate::constants::*;
-
 #[inline(always)]
 pub(crate) fn lzav_match_len(p1: &[u8], p2: &[u8], ml: usize) -> usize {
     let mut pos = 0;
@@ -69,21 +67,24 @@ pub(crate) mod arch {
 
     #[inline(always)]
     pub fn copy_block(dst: &mut [u8], src: &[u8], len: usize) -> Option<()> {
+        if len == 0 || len > dst.len() || len > src.len() {
+            return None;
+        }
+
         let len = len.min(dst.len()).min(src.len());
         if len >= 32 {
-            let mut offset = 0;
-            while offset + 32 <= len {
-                // Safe SIMD copy with bounds checking
-                unsafe {
+            unsafe {
+                let mut offset = 0;
+                while offset + 32 <= len {
                     _mm256_storeu_si256(
                         dst[offset..].as_mut_ptr() as *mut __m256i,
                         _mm256_loadu_si256(src[offset..].as_ptr() as *const __m256i)
                     );
+                    offset += 32;
                 }
-                offset += 32;
-            }
-            if offset < len {
-                dst[offset..len].copy_from_slice(&src[offset..len]);
+                if offset < len {
+                    dst[offset..len].copy_from_slice(&src[offset..len]);
+                }
             }
         } else {
             dst[..len].copy_from_slice(&src[..len]);
