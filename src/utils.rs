@@ -1,29 +1,72 @@
+#[cfg(feature = "simd")]
 #[inline(always)]
 pub(crate) fn lzav_match_len(p1: &[u8], p2: &[u8], ml: usize) -> usize {
+    // Early bounds check
+    let max_len = ml.min(p1.len()).min(p2.len());
+    if max_len == 0 {
+        return 0;
+    }
+
     let mut pos = 0;
 
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::*;
-        while pos + 8 <= ml && pos + 8 <= p1.len() && pos + 8 <= p2.len() {
-            // Safe SIMD operations using checked slices
-            let v1 = unsafe { _mm_loadu_si64(p1[pos..].as_ptr() as *const _) };
-            let v2 = unsafe { _mm_loadu_si64(p2[pos..].as_ptr() as *const _) };
-            let mask = unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(v1, v2)) };
-            if mask != 0xFFFF {
-                return pos + (mask.trailing_zeros() as usize >> 3);
+        while pos + 8 <= max_len {
+            unsafe {
+                if let (Some(slice1), Some(slice2)) = (p1.get(pos..pos + 8), p2.get(pos..pos + 8)) {
+                    let v1 = _mm_loadu_si64(slice1.as_ptr() as *const _);
+                    let v2 = _mm_loadu_si64(slice2.as_ptr() as *const _);
+                    let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v1, v2));
+                    if mask != 0xFFFF {
+                        return pos + (mask.trailing_zeros() as usize >> 3);
+                    }
+                } else {
+                    break;
+                }
             }
             pos += 8;
         }
     }
 
-    // Fallback/remaining bytes using safe slice operations
-    while pos < ml && pos < p1.len() && pos < p2.len() && p1[pos] == p2[pos] {
+    while pos < max_len && p1[pos] == p2[pos] {
         pos += 1;
     }
     pos
 }
 
+#[cfg(not(feature = "simd"))]
+#[inline(always)]
+pub(crate) fn lzav_match_len(p1: &[u8], p2: &[u8], ml: usize) -> usize {
+    let max_len = ml.min(p1.len()).min(p2.len());
+    if max_len == 0 {
+        return 0;
+    }
+
+    let mut pos = 0;
+    
+    // Unroll the loop by 4 for better performance
+    while pos + 4 <= max_len {
+        let equal = p1[pos] == p2[pos]
+            && p1[pos + 1] == p2[pos + 1]
+            && p1[pos + 2] == p2[pos + 2]
+            && p1[pos + 3] == p2[pos + 3];
+        if !equal {
+            // Find the exact position where mismatch occurred
+            while p1[pos] == p2[pos] { pos += 1; }
+            return pos;
+        }
+        pos += 4;
+    }
+
+    // Handle remaining bytes
+    while pos < max_len && p1[pos] == p2[pos] {
+        pos += 1;
+    }
+    pos
+}
+
+#[cfg(feature = "simd")]
 #[inline(always)]
 pub(crate) fn lzav_match_len_r(p1: &[u8], p2: &[u8], ml: usize) -> usize {
     if ml == 0 || p1[0] != p2[0] {
@@ -31,11 +74,73 @@ pub(crate) fn lzav_match_len_r(p1: &[u8], p2: &[u8], ml: usize) -> usize {
     }
 
     let mut pos = 1;
-    while pos < ml && p1[pos] == p2[pos] {
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        while pos + 8 <= ml {
+            unsafe {
+                if let (Some(slice1), Some(slice2)) = (p1.get(pos..pos + 8), p2.get(pos..pos + 8)) {
+                    let v1 = _mm_loadu_si64(slice1.as_ptr() as *const _);
+                    let v2 = _mm_loadu_si64(slice2.as_ptr() as *const _);
+                    let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v1, v2));
+                    if mask != 0xFFFF {
+                        return pos + (mask.trailing_zeros() as usize >> 3);
+                    }
+                } else {
+                    break;
+                }
+            }
+            pos += 8;
+        }
+        }
+
+        // Handle remaining bytes with an unrolled loop for better performance
+        while pos + 4 <= ml {
+        let equal = p1[pos] == p2[pos] 
+            && p1[pos + 1] == p2[pos + 1]
+            && p1[pos + 2] == p2[pos + 2]
+            && p1[pos + 3] == p2[pos + 3];
+        if !equal {
+            while p1[pos] == p2[pos] { pos += 1; }
+            return pos;
+        }
+        pos += 4;
+        }
+
+        // Handle any remaining bytes
+        while pos < ml && p1[pos] == p2[pos] {
         pos += 1;
+        }
+        pos
     }
-    pos
-}
+
+    #[cfg(not(feature = "simd"))]
+    #[inline(always)]
+    pub(crate) fn lzav_match_len_r(p1: &[u8], p2: &[u8], ml: usize) -> usize {
+        if ml == 0 || p1[0] != p2[0] {
+        return 0;
+        }
+
+        let mut pos = 1;
+        // Use unrolled loop for better performance
+        while pos + 4 <= ml {
+        let equal = p1[pos] == p2[pos]
+            && p1[pos + 1] == p2[pos + 1]
+            && p1[pos + 2] == p2[pos + 2]
+            && p1[pos + 3] == p2[pos + 3];
+        if !equal {
+            while p1[pos] == p2[pos] { pos += 1; }
+            return pos;
+        }
+        pos += 4;
+        }
+
+        while pos < ml && p1[pos] == p2[pos] {
+        pos += 1;
+        }
+        pos
+    }
 
 #[repr(align(32))]
 pub(crate) struct AlignedBuffer {

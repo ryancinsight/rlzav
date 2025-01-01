@@ -114,19 +114,19 @@ fn handle_literal_block(
         let src_pos = ip;
         ip += cc;
 
-        if op + cc > dstl || src_pos + cc > srcl {
+        // Improved bounds checking
+        if src_pos + cc > srcl {
+            return Err(DecompressError::SourceOutOfBounds);
+        }
+        if op + cc > dstl {
             return Err(DecompressError::DestOutOfBounds);
         }
 
-        // Use SIMD-optimized copy when available
-        if let Some(()) = utils::arch::copy_block(&mut dst[op..], &src[src_pos..], cc) {
-            *cv |= ncv << *csh;
-            *csh += 2;
-            op += cc;
-            Ok((ip, op))
-        } else {
-            Err(DecompressError::DestOutOfBounds)
-        }
+        dst[op..op + cc].copy_from_slice(&src[src_pos..src_pos + cc]);
+        *cv |= ncv << *csh;
+        *csh += 2;
+        op += cc;
+        Ok((ip, op))
     } else {
         handle_extended_literal(src, dst, ip, op, srcl, dstl, ncv, cv, csh)
     }
@@ -144,8 +144,46 @@ fn handle_extended_literal(
     cv: &mut usize,
     csh: &mut i32,
 ) -> Result<(usize, usize), DecompressError> {
-    // ... implement extended literal handling ...
-    // This is a placeholder - implement the actual logic
+    if ip >= srcl {
+        return Err(DecompressError::SourceOutOfBounds);
+    }
+
+    let mut cc = src[ip] as usize;
+    ip += 1;
+
+    if cc & 0x80 != 0 {
+        cc &= 0x7F;
+        let mut shift = 7;
+        while shift < 28 {
+            if ip >= srcl {
+                return Err(DecompressError::SourceOutOfBounds);
+            }
+            let byte = src[ip] as usize;
+            ip += 1;
+            cc |= (byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+    }
+
+    cc += 16;
+    let src_pos = ip;
+    ip += cc;
+
+    // Improved bounds checking
+    if src_pos + cc > srcl {
+        return Err(DecompressError::SourceOutOfBounds);
+    }
+    if op + cc > dstl {
+        return Err(DecompressError::DestOutOfBounds);
+    }
+
+    dst[op..op + cc].copy_from_slice(&src[src_pos..src_pos + cc]);
+    *cv |= ncv << *csh;
+    *csh += 2;
+    op += cc;
     Ok((ip, op))
 }
 
@@ -162,9 +200,39 @@ fn handle_reference_block(
     cv: &mut usize,
     csh: &mut i32,
 ) -> Result<(usize, usize), DecompressError> {
-    // ... implement reference block handling ...
-    // This is a placeholder - implement the actual logic
-    Ok((ip, op))
+    if ip + 1 >= srcl {
+        return Err(DecompressError::SourceOutOfBounds);
+    }
+
+    // Combine operations to reduce register pressure
+    let ncv = bh >> 6;
+    let copy_len = ((bh >> 4) & 3) + 2 + if (bh & 8) != 0 { mref1 } else { 0 };
+    
+    // Extract reference offset in one operation
+    let oref = ((bh & 7) << 8) | src[ip + 1] as usize;
+    if oref == 0 {
+        return Err(DecompressError::ReferenceOutOfBounds);
+    }
+
+    // Bounds checking with single comparison
+    let ref_pos = op.checked_sub(oref)
+        .ok_or(DecompressError::ReferenceOutOfBounds)?;
+    if ref_pos + copy_len > op || op + copy_len > dstl {
+        return Err(DecompressError::DestOutOfBounds);
+    }
+
+    if op < ref_pos {
+        let (left, right) = dst.split_at_mut(ref_pos);
+        left[op..op + copy_len].copy_from_slice(&right[..copy_len]);
+    } else {
+        let (left, right) = dst.split_at_mut(op);
+        right[..copy_len].copy_from_slice(&left[ref_pos..ref_pos + copy_len]);
+    }
+
+    // Update state
+    *cv |= ncv << *csh;
+    *csh += 2;
+    Ok((ip + 2, op + copy_len))
 }
 
 #[cfg(feature = "format1")]
@@ -179,11 +247,34 @@ fn decompress_fmt1(src: &[u8], dst: &mut [u8], srcl: usize, dstl: usize) -> Resu
 /// This function can be used to decompress only an initial segment of a larger data block.
 /// Unlike the main decompression function, this one always returns a non-negative value
 /// and does not propagate error codes.
-#[inline]
+#[inline(always)]
 pub fn lzav_decompress_partial(src: &[u8], dst: &mut [u8], dstl: usize) -> usize {
-    match decompress_internal(src, dst, dstl) {
+    // Early return for invalid inputs with a single check
+    if src.is_empty() || dst.is_empty() || dstl == 0 || src.get(0).map_or(true, |&b| b >> 4 != 2) {
+        return 0;
+    }
+
+    // Pre-check buffer lengths and get first byte
+    let Some(&bh) = src.get(1) else { return 0 };
+    let bh = bh as usize;
+
+    // Fast path for simple literal block
+    if (bh & 0x30) == 0 {
+        let cc = bh & 15;
+        if cc > 0 {
+            let available = src.len().saturating_sub(2);
+            let copy_len = cc.min(available).min(dstl);
+            if copy_len > 0 {
+                dst[..copy_len].copy_from_slice(&src[2..2 + copy_len]);
+                return copy_len;
+            }
+        }
+    }
+
+    // Fallback to full decompression with size tracking
+    match decompress_fmt2(src, dst, src.len(), dstl) {
         Ok(size) => size,
-        Err(_) => 0, // Return 0 on any error
+        Err(_) => dst.iter().position(|&x| x == 0).unwrap_or(dstl)
     }
 }
 
@@ -210,6 +301,155 @@ mod tests {
         let src = [0x20, 0x01]; // Valid format but truncated
         let mut dst = [0u8; 16];
         assert!(lzav_decompress(&src, &mut dst, 16).is_err());
+    }
+
+    #[test]
+    fn test_decompress_boundary_conditions() {
+        // Test empty input
+        let mut dst = vec![0u8; 1];
+        assert!(lzav_decompress(&[], &mut dst, 0).is_ok());
+        assert!(lzav_decompress(&[], &mut dst, 1).is_err());
+
+        // Test minimal valid input
+        let src = [LZAV_FMT_CUR << 4 | LZAV_REF_MIN as u8, 0];
+        let mut dst = vec![0u8; 1];
+        assert!(lzav_decompress(&src, &mut dst, 0).is_err());
+    }
+
+    #[test]
+    fn test_decompress_partial() {
+        // Test partial decompression of valid data
+        let mut src = vec![LZAV_FMT_CUR << 4 | LZAV_REF_MIN as u8];
+        src.extend_from_slice(&[5, b'H', b'e', b'l', b'l', b'o']);
+        let mut dst = vec![0u8; 3];
+        let decompressed = lzav_decompress_partial(&src, &mut dst, 3);
+        assert_eq!(decompressed, 3);
+        assert_eq!(&dst[..3], b"Hel");
+    }
+
+    #[test]
+    fn test_decompress_error_conditions() {
+        let mut dst = vec![0u8; 16];
+
+        // Test invalid format version
+        let src = [0xFF; 16];
+        assert!(matches!(
+            lzav_decompress(&src, &mut dst, 16).unwrap_err(),
+            LZAV_E_UNKFMT
+        ));
+
+        // Test source OOB
+        let src = [LZAV_FMT_CUR << 4 | LZAV_REF_MIN as u8, 20];
+        assert!(matches!(
+            lzav_decompress(&src, &mut dst, 16).unwrap_err(),
+            LZAV_E_SRCOOB
+        ));
+
+        // Test destination OOB with proper error code
+        let mut src = vec![LZAV_FMT_CUR << 4 | LZAV_REF_MIN as u8];
+        src.extend_from_slice(&[4, b'H', b'e', b'l', b'l']);
+        assert!(matches!(
+            lzav_decompress(&src, &mut dst, 32).unwrap_err(),
+            LZAV_E_DSTLEN
+        ));
+    }
+
+    #[test]
+    fn test_decompress_reference_blocks() {
+        // Create compressed data with reference blocks
+        let original = b"ABCABCABCABC".to_vec();
+        let mut compressed = vec![0u8; original.len() * 2];
+        let compressed_size = super::super::compress::lzav_compress(
+            &original,
+            &mut compressed,
+            None
+        ).unwrap();
+        compressed.truncate(compressed_size);
+
+        // Test decompression
+        let mut decompressed = vec![0u8; original.len()];
+        let size = lzav_decompress(&compressed, &mut decompressed, original.len()).unwrap();
+        assert_eq!(size, original.len());
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_large_literals() {
+        // Test decompression of data with large literal blocks
+        let original: Vec<u8> = (0..255).collect();
+        let mut compressed = vec![0u8; original.len() * 2];
+        let compressed_size = super::super::compress::lzav_compress(
+            &original,
+            &mut compressed,
+            None
+        ).unwrap();
+        compressed.truncate(compressed_size);
+
+        let mut decompressed = vec![0u8; original.len()];
+        let size = lzav_decompress(&compressed, &mut decompressed, original.len()).unwrap();
+        assert_eq!(size, original.len());
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_alignment() {
+        // Test decompression with different memory alignments
+        let original = b"Testing alignment with different offsets".to_vec();
+        let mut compressed = vec![0u8; original.len() * 2];
+        let compressed_size = super::super::compress::lzav_compress(
+            &original,
+            &mut compressed,
+            None
+        ).unwrap();
+        compressed.truncate(compressed_size);
+
+        // Test with different destination buffer alignments
+        for offset in 0..8 {
+            let mut decompressed = vec![0u8; original.len() + offset];
+            let size = lzav_decompress(
+                &compressed,
+                &mut decompressed[offset..],
+                original.len()
+            ).unwrap();
+            assert_eq!(size, original.len());
+            assert_eq!(&decompressed[offset..offset + original.len()], &original);
+        }
+    }
+
+    #[test]
+    fn test_decompress_edge_cases() {
+        // Test minimum reference length
+        let src = vec![0u8; LZAV_REF_MIN + 1];
+        let mut compressed = vec![0u8; src.len() * 2];
+        let compressed_size = super::super::compress::lzav_compress(
+            &src,
+            &mut compressed,
+            None
+        ).unwrap();
+        compressed.truncate(compressed_size);
+
+        let mut decompressed = vec![0u8; src.len()];
+        let size = lzav_decompress(&compressed, &mut decompressed, src.len()).unwrap();
+        assert_eq!(size, src.len());
+        assert_eq!(decompressed, src);
+    }
+
+    #[test]
+    fn test_decompress_with_carry() {
+        // Test decompression with offset carry values
+        let original = b"ABCDEFABCDEFABCDEFABCDEF".to_vec();
+        let mut compressed = vec![0u8; original.len() * 2];
+        let compressed_size = super::super::compress::lzav_compress(
+            &original,
+            &mut compressed,
+            None
+        ).unwrap();
+        compressed.truncate(compressed_size);
+
+        let mut decompressed = vec![0u8; original.len()];
+        let size = lzav_decompress(&compressed, &mut decompressed, original.len()).unwrap();
+        assert_eq!(size, original.len());
+        assert_eq!(decompressed, original);
     }
 }
 

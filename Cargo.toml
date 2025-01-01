@@ -1,5 +1,5 @@
 [package]
-name = "lzav"
+name = "lzav-rs"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ryan Clanton <ryanclanton@outlook.com>"]
