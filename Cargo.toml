@@ -1,5 +1,5 @@
 [package]
-name = "lzav-rs"
+name = "rlzav"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ryan Clanton <ryanclanton@outlook.com>"]
@@ -8,24 +8,18 @@ license = "MIT"
 repository = "https://github.com/yourusername/lzav-rs"
 
 [features]
-default = ["simd"]
-simd = []  # Enable SIMD optimizations
-format1 = []  # Enable format1 decompression support
-unsafe_optimizations = []  # Enable unsafe optimizations for better performance
-bmi1 = []  # Enable BMI1 instruction set features
-
+default = ["c-backend"]  # Use C implementation by default
+c-backend = ["cc"]       # C implementation
+rust-backend = []        # Pure Rust implementation
 [dependencies]
-# Add optional dependencies for SIMD
-cfg-if = "1.0"
-
+libc = "0.2"
 [dev-dependencies]
-criterion = "0.5"
 rand = "0.8"
+
+[build-dependencies]
+cc = { version = "1.0", optional = true }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-# Empty section to enable target-specific feature detection

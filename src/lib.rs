@@ -1,81 +1,169 @@
-//! LZAV compression library
-//! 
-//! This is a Rust implementation of the LZAV compression algorithm.
-//! Original C implementation: https://github.com/avaneev/lzav
-//!
-//! Note that compression algorithm and its output on the same source data may
-//! differ between LZAV versions, and may differ between big- and little-endian
-//! systems. However, the decompression of a compressed data produced by any
-//! prior compressor version will remain possible.
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
 
-pub mod constants;
-pub mod compress;
-pub mod decompress;
-pub mod error;
-mod utils;
+// Shared modules between implementations
+pub mod errors;
 
-// Add test module
+// Implementation-specific modules
+#[cfg(feature = "c-backend")]
+pub mod c;
+#[cfg(feature = "rust-backend")]
+pub mod rust;
+
+// Re-export the active implementation
+#[cfg(feature = "c-backend")]
+pub use crate::c::*;
+
+#[cfg(feature = "rust-backend")]
+pub use crate::rust::*;
+
+// Re-export compression functions
+#[cfg(feature = "rust-backend")]
+pub use crate::rust::{
+    compress_default,
+    compress_bound,
+};
+
+#[cfg(feature = "c-backend")]
+pub use crate::c::compress_bound;
+
+// Re-export decompression function
+#[cfg(feature = "rust-backend")]
+pub use crate::rust::decompress;
+
+#[cfg(feature = "c-backend")]
+pub use crate::c::decompress;
+
+// Common interface that both implementations must provide
+pub trait Lzav {
+    fn compress_default(src: &[u8], dst: &mut [u8]) -> i32;
+    fn compress_bound(srcl: i32) -> i32;
+    fn decompress(src: &[u8], dst: &mut [u8]) -> i32;
+    fn decompress_partial(src: &[u8], dst: &mut [u8]) -> i32;
+}
+
+#[cfg(feature = "c-backend")]
+pub fn init() {
+    // Initialize C backend error codes
+    use crate::errors::*;
+    unsafe {
+        LZAV_ERR_CODES[0].set(c::c_get_lzav_e_params()).unwrap();
+        LZAV_ERR_CODES[1].set(c::c_get_lzav_e_srcoob()).unwrap();
+        LZAV_ERR_CODES[2].set(c::c_get_lzav_e_dstoob()).unwrap();
+        LZAV_ERR_CODES[3].set(c::c_get_lzav_e_refoob()).unwrap();
+        LZAV_ERR_CODES[4].set(c::c_get_lzav_e_dstlen()).unwrap();
+        LZAV_ERR_CODES[5].set(c::c_get_lzav_e_unkfmt()).unwrap();
+    }
+}
+
 #[cfg(test)]
-pub mod tests;
+mod tests {
+    use super::*;
+    use rand::Rng;
 
-pub use compress::lzav_compress;
-pub use decompress::{lzav_decompress, lzav_decompress_partial};
-pub use error::LzavError;
+    fn verify_roundtrip(original: &[u8]) {
 
-// Add optimization hint macros
-#[macro_export]
-macro_rules! likely {
-    ($x:expr) => {
-        if cfg!(all(target_arch = "x86_64", target_feature = "sse2")) {
-            #[allow(unused_unsafe)]
-            unsafe { std::intrinsics::likely($x) }
-        } else {
-            $x
+        let mut compressed = vec![0u8; compress_bound(original.len() as i32) as usize];
+
+        let mut decompressed = vec![0u8; original.len()];
+
+        let compressed_len = compress_default(original, &mut compressed);
+        assert!(compressed_len > 0, "Compression failed");
+
+        println!("\nCompression Results:");
+        println!("Original size: {} bytes", original.len());
+        println!("Compressed size: {} bytes", compressed_len);
+        println!("Compression ratio: {:.2}%", 
+            (compressed_len as f64 / original.len() as f64) * 100.0);
+
+        let decompressed_len = decompress(&compressed[..compressed_len as usize], &mut decompressed);
+
+        {
+            // Cast `i32` to `usize` for slice indexing
+            let decompressed_length = decompressed_len as usize;
+            assert_eq!(decompressed_length, original.len(),
+                "Decompressed length does not match original length");
+            assert_eq!(&decompressed[..decompressed_length], original, "Decompressed data does not match original");
         }
-    };
-}
 
-#[macro_export]
-macro_rules! unlikely {
-    ($x:expr) => {
-        if cfg!(all(target_arch = "x86_64", target_feature = "sse2")) {
-            #[allow(unused_unsafe)]
-            unsafe { std::intrinsics::unlikely($x) }
-        } else {
-            $x
+        // Print first few bytes for verification
+        println!("\nData sample (first 16 bytes or less):");
+        println!("Original:    {:02x?}", &original[..original.len().min(16)]);
+        println!("Decompressed:{:02x?}", &decompressed[..decompressed.len().min(16)]);
+        
+        if original.len() > 16 {
+            println!("...");
         }
-    };
-}
-
-/// Returns the required buffer size for LZAV compression.
-///
-/// This function helps allocate a sufficiently large destination buffer for compression.
-#[inline]
-pub fn lzav_compress_bound(srcl: i32) -> i32 {
-    if srcl <= 0 {
-        return 16;
     }
-    let k = 16 + 127 + 1;
-    let l2 = srcl / (k + 6);
-    (srcl - l2 * 6 + k - 1) / k * 2 - l2 + srcl + 16
-}
 
-/// Returns the required buffer size for higher-ratio LZAV compression.
-///
-/// Note that the higher-ratio compression is much slower than the standard compression.
-#[inline]
-pub fn lzav_compress_bound_hi(srcl: i32) -> i32 {
-    if srcl <= 0 {
-        return 16;
+    #[test]
+    fn test_compress_decompress() {
+        let original = b"Hello, World!";
+        verify_roundtrip(original);
     }
-    let l2 = srcl / (16 + 5);
-    (srcl - l2 * 5 + 15) / 16 * 2 - l2 + srcl + 16
-}
 
-/// Default compression function without external buffer option.
-///
-/// This is a convenience wrapper around `lzav_compress` that uses default settings.
-#[inline]
-pub fn lzav_compress_default(src: &[u8], dst: &mut [u8]) -> Result<usize, i32> {
-    lzav_compress(src, dst, None)
+    #[test]
+    fn test_compress_bound() {
+        {
+            assert!(compress_bound(100) > 0);
+            assert_eq!(compress_bound(0), 16);
+            assert!(compress_bound(1) > 0);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_random_data() {
+        let mut rng = rand::thread_rng();
+        let size = 1024;
+        let original: Vec<u8> = (0..size).map(|_| rng.gen()).collect();
+        verify_roundtrip(&original);
+    }
+
+    #[test]
+    fn test_html_compression() {
+        let data = br#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Page</title>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome</h1>
+        <p>This is a test page with repeating content.</p>
+        <div class="container">
+            <h1>Welcome</h1>
+            <p>This is a test page with repeating content.</p>
+        </div>
+    </div>
+</body>
+</html>"#;
+        verify_roundtrip(data);
+    }
+
+    #[test]
+    fn test_json_compression() {
+        let data = br#"{"key":"value","array":[1,2,3],"nested":{"hello":"world","array":[1,2,3,4,5]},"repeated":{"hello":"world","array":[1,2,3,4,5]}}"#;
+        verify_roundtrip(data);
+    }
+
+    #[test]
+    fn test_markdown_compression() {
+        let data = br#"# Title
+
+Some text with **bold** formatting.
+
+## Section 1
+- List item 1
+- List item 2
+- List item 3
+
+## Section 2
+Same content repeated:
+- List item 1
+- List item 2
+- List item 3
+"#;
+        verify_roundtrip(data);
+    }
 }
