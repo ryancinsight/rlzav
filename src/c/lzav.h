@@ -62,23 +62,190 @@ typedef enum {
 #define LZAV_REF_MIN 6
 #define LZAV_REF_LEN ( LZAV_REF_MIN + 15 + 255 + 254 )
 #define LZAV_LIT_FIN 6
+static inline void *lzav_memcpy(void *dest, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    const size_t word_size = sizeof(uintptr_t);
+    const uintptr_t word_mask = word_size - 1;
+
+    // Fast path for small copies using bitwise ops
+    if (n < (word_size << 1)) {
+        while (n--) *d++ = *s++;
+        return dest;
+    }
+
+    // Align destination using bitwise AND
+    size_t head = (~(uintptr_t)d + 1) & word_mask;
+    if (head) {
+        n -= head;
+        while (head--) *d++ = *s++;
+    }
+
+    uintptr_t *dw = (uintptr_t *)(void *)d;
+    
+    if ((uintptr_t)s & word_mask) {
+        // Unaligned source - use SWAR
+        const unsigned char *sw = s;
+        size_t words = n >> (word_size == 8 ? 3 : 2);
+        while (words--) {
+            uintptr_t word = 0;
+            for (size_t i = 0; i < word_size; i++) {
+                word |= ((uintptr_t)sw[i] << (i << 3));
+            }
+            *dw++ = word;
+            sw += word_size;
+        }
+        s = sw;
+    } else {
+        // Aligned source - use direct copy with unrolling
+        const uintptr_t *sw = (const uintptr_t *)(const void *)s;
+        size_t words = n >> (word_size == 8 ? 3 : 2);
+        while (words >= 4) {
+            dw[0] = sw[0];
+            dw[1] = sw[1];
+            dw[2] = sw[2];
+            dw[3] = sw[3];
+            dw += 4;
+            sw += 4;
+            words -= 4;
+        }
+        while (words--) *dw++ = *sw++;
+        s = (const unsigned char *)sw;
+    }
+
+    d = (unsigned char *)dw;
+    n &= word_mask;
+    while (n--) *d++ = *s++;
+
+    return dest;
+}
+
+static inline void *lzav_memset(void *dest, uint8_t value, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    const size_t word_size = sizeof(uintptr_t);
+    const uintptr_t word_mask = word_size - 1;
+
+    if (n < (word_size << 1)) {
+        while (n--) *d++ = value;
+        return dest;
+    }
+
+    // Create pattern using shifts instead of multiplication
+    uintptr_t pattern = value;
+    pattern |= pattern << 8;
+    pattern |= pattern << 16;
+    if (word_size == 8) {
+        pattern |= pattern << 32;
+    }
+
+    // Align destination using bitwise AND
+    size_t head = (~(uintptr_t)d + 1) & word_mask;
+    if (head) {
+        if (head > n) head = n; // Prevent overshoot
+        n -= head;
+        while (head--) *d++ = value;
+    }
+
+    uintptr_t *dw = (uintptr_t *)(void *)d;
+    size_t words = n >> (word_size == 8 ? 3 : 2);
+    
+    while (words >= 8) {
+        dw[0] = pattern;
+        dw[1] = pattern;
+        dw[2] = pattern;
+        dw[3] = pattern;
+        dw[4] = pattern;
+        dw[5] = pattern; 
+        dw[6] = pattern;
+        dw[7] = pattern;
+        dw += 8;
+        words -= 8;
+    }
+
+    while (words--) *dw++ = pattern;
+
+    d = (unsigned char *)dw;
+    n &= word_mask;
+    while (n--) *d++ = value;
+
+    return dest;
+}
+
+static inline void *lzav_memmove(void *dest, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    
+    if ((uintptr_t)d - (uintptr_t)s >= n) {
+        return lzav_memcpy(dest, src, n);
+    }
+    
+    const size_t word_size = sizeof(uintptr_t);
+    const uintptr_t word_mask = word_size - 1;
+
+    d += n;
+    s += n;
+
+    if (n < (word_size << 1)) {
+        while (n--) *--d = *--s;
+        return dest;
+    }
+
+    // Align destination using bitwise AND
+    size_t tail = (uintptr_t)d & word_mask;
+    if (tail) {
+        n -= tail;
+        while (tail--) *--d = *--s;
+    }
+
+    uintptr_t *dw = (uintptr_t *)(void *)d;
+    if ((uintptr_t)s & word_mask) {
+        // Unaligned source - use SWAR
+        size_t words = n >> (word_size == 8 ? 3 : 2);
+        while (words--) {
+            s -= word_size;
+            --dw;
+            uintptr_t word = 0;
+            for (size_t i = 0; i < word_size; i++) {
+                word |= ((uintptr_t)s[i] << (i << 3));
+            }
+            *dw = word;
+        }
+    } else {
+        // Aligned source - use direct copy
+        const uintptr_t *sw = (const uintptr_t *)(const void *)s;
+        size_t words = n >> (word_size == 8 ? 3 : 2);
+        while (words--) {
+            --sw;
+            --dw;
+            *dw = *sw;
+        }
+        s = (const unsigned char *)sw;
+    }
+
+    d = (unsigned char *)dw;
+    n &= word_mask;
+    while (n--) *--d = *--s;
+
+    return dest;
+}
 
 // Optimized memory operations
 #define LZAV_MEMCPY_SMALL(d, s, n) \
     do { \
-        if ((n) > 0) memcpy(d, s, n); \
+        if ((n) > 0) lzav_memcpy(d, s, n); \
     } while (0)
-/*
- * macro to let the compiler assume 
- * the given pointer is aligned. This macro will fall back to the pointer 
- * unchanged if the compiler doesn't support __builtin_assume_aligned.
- */
-#if defined(__GNUC__) || defined(__clang__)
-  #define LZAV_ASSUME_ALIGNED(ptr, alignment) \
-    __builtin_assume_aligned(ptr, alignment)
-#else
-  #define LZAV_ASSUME_ALIGNED(ptr, alignment) (ptr)
-#endif
+
+static inline void* lzav_assume_aligned(void* ptr, size_t alignment) {
+    // Verify alignment is power of 2 using bitwise check
+    if ((alignment & (alignment - 1)) != 0) return ptr;
+    
+    // Check if pointer is aligned using bitwise AND
+    if ((uintptr_t)ptr & (alignment - 1)) return ptr;
+    
+    // Return aligned pointer
+    return ptr;
+}
+
 
 // Unified block handling macros
 #define LZAV_BLOCK_HEADER(type, length) ((type) << 4 | (length))
@@ -256,23 +423,72 @@ typedef enum {
 // Faster modulus and bitwise operations
 #define FAST_MOD(x, y) ((x) & ((y) - 1))
 #define FAST_DIV(x, y) ((x) >> __builtin_ctz(y))
+static inline size_t fast_div_pow2(size_t x, size_t y) {
+    // Verify y is power of 2
+    if (y & (y - 1)) return x / y;
+    
+    // Count trailing zeros using SWAR
+    size_t shift = 0;
+    size_t mask = y;
+    
+    if (sizeof(size_t) == 8) {
+        if (!(mask & 0xFFFFFFFF)) { shift += 32; mask >>= 32; }
+        if (!(mask & 0xFFFF)) { shift += 16; mask >>= 16; }
+        if (!(mask & 0xFF)) { shift += 8; mask >>= 8; }
+        if (!(mask & 0xF)) { shift += 4; mask >>= 4; }
+        if (!(mask & 0x3)) { shift += 2; mask >>= 2; }
+        if (!(mask & 0x1)) { shift += 1; }
+    } else {
+        if (!(mask & 0xFFFF)) { shift += 16; mask >>= 16; }
+        if (!(mask & 0xFF)) { shift += 8; mask >>= 8; }
+        if (!(mask & 0xF)) { shift += 4; mask >>= 4; }
+        if (!(mask & 0x3)) { shift += 2; mask >>= 2; }
+        if (!(mask & 0x1)) { shift += 1; }
+    }
+    
+    return x >> shift;
+}
 
 static inline size_t lzav_get_hash_bits(const size_t input_size) {
-    // Use leading zero count to determine optimal bits
-    // This replaces branches with direct bit manipulation
-    const unsigned int leading_zeros = 
-        sizeof(size_t) * 8 - 1 - __builtin_clzll((uint64_t)input_size);
+    const size_t word_size = sizeof(size_t) * 8;
+    const size_t word_mask = word_size - 1;
+    size_t x = input_size;
+    size_t leading_zeros = 0;
     
-    // Map size ranges to bit values using modulo math
-    // 12 bits (4KB) for small, 15 bits (32KB) for medium, 17 bits (128KB) for large
-    const size_t base_bits = LZAV_HASH_L1_BITS + 
-        ((leading_zeros > 13) ? ((leading_zeros - 13) * 3) >> 1 : 0);
+    // Count leading zeros using SWAR technique
+    x |= (x >> 1);
+    x |= (x >> 2);
+    x |= (x >> 4);
+    x |= (x >> 8);
+    x |= (x >> 16);
+    if (word_size == 64) {
+        x |= (x >> 32);
+    }
     
-    // Clamp to valid range using min/max
-    return (base_bits > LZAV_HASH_L3_BITS ? 
-           LZAV_HASH_L3_BITS : 
-           (base_bits < LZAV_HASH_L1_BITS ? LZAV_HASH_L1_BITS : base_bits));
+    leading_zeros = word_mask - 
+        ((((x & ~(x >> 1)) != 0) << 0) |
+         (((x & ~(x >> 2)) != 0) << 1) |
+         (((x & ~(x >> 4)) != 0) << 2) |
+         (((x & ~(x >> 8)) != 0) << 3) |
+         (((x & ~(x >> 16)) != 0) << 4) |
+         ((word_size == 64) ? (((x & ~(x >> 32)) != 0) << 5) : 0));
+
+    // Calculate base bits using shifts instead of multiplication/division
+    const size_t shift_13 = leading_zeros - 13;
+    const size_t base_shift = (shift_13 & ~(shift_13 >> (word_size - 1)));
+    const size_t base_bits = LZAV_HASH_L1_BITS | 
+        ((base_shift + (base_shift >> 1)) & 
+         ((leading_zeros > 13) ? -1ULL : 0));
+
+    // Clamp using bitwise operations
+    const size_t over = (base_bits > LZAV_HASH_L3_BITS) ? -1ULL : 0;
+    const size_t under = (base_bits < LZAV_HASH_L1_BITS) ? -1ULL : 0;
+    
+    return (base_bits & ~over & ~under) | 
+           (LZAV_HASH_L3_BITS & over) |
+           (LZAV_HASH_L1_BITS & under);
 }
+
 
 // Optimized hash table size selection
 static inline uint32_t lzav_get_hash_mask(const size_t input_size) {
@@ -351,8 +567,8 @@ static inline size_t lzav_match_len_opt(const uint8_t p1[], const uint8_t p2[],
     }
 
     // Assume alignment of p1, p2 to 16 bytes for faster SIMD loads
-    const uint8_t* p1_aligned = LZAV_ASSUME_ALIGNED(p1, 16);
-    const uint8_t* p2_aligned = LZAV_ASSUME_ALIGNED(p2, 16);
+    const uint8_t* p1_aligned = lzav_assume_aligned(p1, 16);
+    const uint8_t* p2_aligned = lzav_assume_aligned(p2, 16);
 
     // Prefetch distant cache lines (unchanged)
     LZAV_PREFETCH(p1_aligned + LZAV_PREFETCH_DIST);
@@ -415,8 +631,8 @@ static inline size_t lzav_match_len_opt(const uint8_t p1[], const uint8_t p2[],
     // Process remaining bytes with 64-bit operations
     while (LZAV_LIKELY(p1 + 7 < p1e)) {
         uint64_t v1, v2;
-        memcpy(&v1, p1, 8);
-        memcpy(&v2, p2, 8);
+        lzav_memcpy(&v1, p1, 8);
+        lzav_memcpy(&v2, p2, 8);
         if (v1 != v2) {
             #if defined(__GNUC__) || defined(__clang__)
                 return p1 - p1s + (__builtin_ctzll(v1 ^ v2) >> 3);
@@ -459,8 +675,8 @@ static inline size_t lzav_match_len_opt(const uint8_t p1[], const uint8_t p2[],
 /* Keep C-compatible version only */
 static inline uint32_t lzav_read32_c(const uint8_t* p) {
     uint32_t val;
-    // This encapsulates memcpy but can be switched to pass-by-const-reference in C++
-    memcpy(&val, p, sizeof(val));
+    // This encapsulates lzav_memcpy but can be switched to pass-by-const-reference in C++
+    lzav_memcpy(&val, p, sizeof(val));
     return val;
 }
 
@@ -475,8 +691,8 @@ static inline size_t lzav_match_len( const uint8_t p1[], const uint8_t p2[],
 	while( LZAV_LIKELY( p1 + 7 < p1e ))
 	{
 		uint64_t v1, v2, vd;
-		memcpy( &v1, p1, 8 );
-		memcpy( &v2, p2, 8 );
+		lzav_memcpy( &v1, p1, 8 );
+		lzav_memcpy( &v2, p2, 8 );
 		vd = v1 ^ v2;
 
 		if( vd != 0 )
@@ -617,8 +833,8 @@ static inline size_t lzav_match_len_r( const uint8_t p1[], const uint8_t p2[],
 		while( LZAV_UNLIKELY( p1 > p1e ))
 		{
 			uint16_t v1, v2;
-			memcpy( &v1, p1 - 2, 2 );
-			memcpy( &v2, p2 - 2, 2 );
+			lzav_memcpy( &v1, p1 - 2, 2 );
+			lzav_memcpy( &v2, p2 - 2, 2 );
 
 			const uint32_t vd = v1 ^ v2;
 
@@ -659,8 +875,8 @@ static inline size_t lzav_match_len_opt_r(const uint8_t p1[], const uint8_t p2[]
     }
 
     // Assume alignment of p1, p2 to 16 bytes for faster SIMD loads
-    const uint8_t* p1_aligned = LZAV_ASSUME_ALIGNED(p1 - ml, 16);
-    const uint8_t* p2_aligned = LZAV_ASSUME_ALIGNED(p2 - ml, 16);
+    const uint8_t* p1_aligned = lzav_assume_aligned(p1 - ml, 16);
+    const uint8_t* p2_aligned = lzav_assume_aligned(p2 - ml, 16);
 
     // Prefetch distant cache lines
     LZAV_PREFETCH(p1_aligned - LZAV_PREFETCH_DIST);
@@ -725,8 +941,8 @@ static inline size_t lzav_match_len_opt_r(const uint8_t p1[], const uint8_t p2[]
     // Process remaining bytes with 64-bit operations
     while (LZAV_LIKELY(p1 - 7 >= p1e)) {
         uint64_t v1, v2;
-        memcpy(&v1, p1 - 8, 8);
-        memcpy(&v2, p2 - 8, 8);
+        lzav_memcpy(&v1, p1 - 8, 8);
+        lzav_memcpy(&v2, p2 - 8, 8);
         if (v1 != v2) {
             #if defined(__GNUC__) || defined(__clang__)
                 return p1s - (p1 - (__builtin_ctzll(v1 ^ v2) >> 3) + 8);
@@ -826,7 +1042,7 @@ static inline uint8_t* lzav_write_blk_2( uint8_t* op, size_t lc, size_t rc,
 			*op = (uint8_t) ( cv | lc );
 			++op;
 
-			memcpy( op, ipa, 8 );
+			lzav_memcpy( op, ipa, 8 );
 			op += lc;
 		}
 		else
@@ -835,7 +1051,7 @@ static inline uint8_t* lzav_write_blk_2( uint8_t* op, size_t lc, size_t rc,
 			*op = (uint8_t) ( cv | lc );
 			++op;
 
-			memcpy( op, ipa, 16 );
+			lzav_memcpy( op, ipa, 16 );
 			op += lc;
 		}
 		else
@@ -847,11 +1063,11 @@ static inline uint8_t* lzav_write_blk_2( uint8_t* op, size_t lc, size_t rc,
 			uint16_t ov = (uint16_t) ( cv << 8 | ( lc - 16 ));
 		#endif // LZAV_LITTLE_ENDIAN
 
-			memcpy( op, &ov, 2 );
+			lzav_memcpy( op, &ov, 2 );
 			op += 2;
 
-			memcpy( op, ipa, 16 );
-			memcpy( op + 16, ipa + 16, 16 );
+			lzav_memcpy( op, ipa, 16 );
+			lzav_memcpy( op + 16, ipa + 16, 16 );
 
 			if( lc < 33 )
 			{
@@ -888,7 +1104,7 @@ static inline uint8_t* lzav_write_blk_2( uint8_t* op, size_t lc, size_t rc,
 			*op = (uint8_t) lcw;
 			++op;
 
-			memcpy( op, ipa, lc );
+			lzav_memcpy( op, ipa, lc );
 			op += lc;
 		}
 	}
@@ -902,7 +1118,7 @@ static inline uint8_t* lzav_write_blk_2( uint8_t* op, size_t lc, size_t rc,
 	{
 		uint32_t ov = (uint32_t) ( d << 6 | bt << 4 | rc );
 		LZAV_IEC32( ov );
-		memcpy( op, &ov, 4 );
+		lzav_memcpy( op, &ov, 4 );
 
 		op += bt;
 		*cshp = ocsh[ bt ];
@@ -913,7 +1129,7 @@ static inline uint8_t* lzav_write_blk_2( uint8_t* op, size_t lc, size_t rc,
 
 	uint32_t ov = (uint32_t) ( d << 6 | bt << 4 );
 	LZAV_IEC32( ov );
-	memcpy( op, &ov, 4 );
+	lzav_memcpy( op, &ov, 4 );
 
 	op += bt;
 	*cshp = ocsh[ bt ];
@@ -971,7 +1187,7 @@ static inline uint8_t* lzav_write_fin_2( uint8_t* op, size_t lc,
 
 	}
 
-	memcpy( op, ipa, lc );
+	lzav_memcpy( op, ipa, lc );
 	return op + lc;
 }
 
@@ -1094,7 +1310,7 @@ static inline int lzav_compress( const void* const src, void* const dst,
         if (srcl > LZAV_LIT_FIN - 1) {
             return 2 + srcl;
         }
-        memset(op + srcl, 0, LZAV_LIT_FIN - srcl);
+        lzav_memset(op + srcl, 0, LZAV_LIT_FIN - srcl);
         return 2 + LZAV_LIT_FIN;
     }
 
@@ -1182,7 +1398,7 @@ static inline int lzav_compress( const void* const src, void* const dst,
 
 	if( LZAV_LIKELY( ip < ipet ))
 	{
-		memcpy( initv, ip, 4 );
+		lzav_memcpy( initv, ip, 4 );
 	}
 
 	uint32_t* ht32 = (uint32_t*) ht;
@@ -1203,9 +1419,9 @@ static inline int lzav_compress( const void* const src, void* const dst,
 
 		uint32_t iw1;
 		uint16_t iw2, ww2;
-		memcpy( &iw1, ip, 4 );
+		lzav_memcpy( &iw1, ip, 4 );
 		const uint32_t Seed1 = 0x243F6A88 ^ iw1;
-		memcpy( &iw2, ip + 4, 2 );
+		lzav_memcpy( &iw2, ip + 4, 2 );
 		const uint64_t hm = (uint64_t) Seed1 * (uint32_t) ( 0x85A308D3 ^ iw2 );
 		const uint32_t hval = (uint32_t) hm ^ (uint32_t) ( hm >> 32 );
 
@@ -1227,7 +1443,7 @@ static inline int lzav_compress( const void* const src, void* const dst,
 			}
 
 			wp = (const uint8_t*) src + hp[ 3 ];
-			memcpy( &ww2, wp + 4, 2 );
+			lzav_memcpy( &ww2, wp + 4, 2 );
 
 			if( LZAV_UNLIKELY( iw2 != ww2 ))
 			{
@@ -1237,7 +1453,7 @@ static inline int lzav_compress( const void* const src, void* const dst,
 		else
 		{
 			wp = (const uint8_t*) src + hp[ 1 ];
-			memcpy( &ww2, wp + 4, 2 );
+			lzav_memcpy( &ww2, wp + 4, 2 );
 
 			if( LZAV_UNLIKELY( iw2 != ww2 ))
 			{
@@ -1247,7 +1463,7 @@ static inline int lzav_compress( const void* const src, void* const dst,
 				}
 
 				wp = (const uint8_t*) src + hp[ 3 ];
-				memcpy( &ww2, wp + 4, 2 );
+				lzav_memcpy( &ww2, wp + 4, 2 );
 
 				if( LZAV_UNLIKELY( iw2 != ww2 ))
 				{
@@ -1441,14 +1657,14 @@ static inline int lzav_compress_hi( const void* const src, void* const dst,
 		*op = (uint8_t) srcl;
 		++op;
 
-		memcpy( op, src, srcl );
+		lzav_memcpy( op, src, srcl );
 
 		if( srcl > LZAV_LIT_FIN - 1 )
 		{
 			return 2 + srcl;
 		}
 
-		memset( op + srcl, 0, LZAV_LIT_FIN - srcl );
+		lzav_memset( op + srcl, 0, LZAV_LIT_FIN - srcl );
 		return 2 + LZAV_LIT_FIN;
 	}
 
@@ -1481,7 +1697,7 @@ static inline int lzav_compress_hi( const void* const src, void* const dst,
 	// the last tuple is used as head tuple offset (an even value).
 
 	uint32_t initv[ 2 ] = { 0, 0 };
-	memcpy( initv, ip, 4 );
+	lzav_memcpy( initv, ip, 4 );
 
 	uint32_t* ht32 = (uint32_t*) ht;
 	uint32_t* const ht32e = (uint32_t*) ( ht + htsize );
@@ -1504,7 +1720,7 @@ static inline int lzav_compress_hi( const void* const src, void* const dst,
 		// https://github.com/avaneev/komihash for details.
 
 		uint32_t iw1;
-		memcpy( &iw1, ip, 4 );
+		lzav_memcpy( &iw1, ip, 4 );
 		const uint64_t hm = (uint64_t) ( 0x243F6A88 ^ iw1 ) *
 			(uint32_t) ( 0x85A308D3 ^ ip[ 4 ]);
 
@@ -1749,16 +1965,16 @@ static inline int32_t lzav_decompress_2( const void* const src, void* const dst,
 
 	#define LZAV_LOAD16( a ) \
 		uint16_t bv; \
-		memcpy( &bv, a, 2 ); \
+		lzav_memcpy( &bv, a, 2 ); \
 		LZAV_IEC16( bv );
 
 	#define LZAV_LOAD32( a ) \
 		uint32_t bv; \
-		memcpy( &bv, a, 4 ); \
+		lzav_memcpy( &bv, a, 4 ); \
 		LZAV_IEC32( bv );
 
 	#define LZAV_MEMMOVE( d, s, c ) \
-		{ uint8_t tmp[ c ]; memcpy( tmp, s, c ); memcpy( d, tmp, c ); }
+		{ uint8_t tmp[ c ]; lzav_memcpy( tmp, s, c ); lzav_memcpy( d, tmp, c ); }
 
 	#define LZAV_SET_IPD_CV( x, v, sh ) \
 		const size_t d = ( x ) << csh | cv; \
@@ -1803,7 +2019,7 @@ static inline int32_t lzav_decompress_2( const void* const src, void* const dst,
 					cv |= ncv;
 					csh += 2;
 					bh = *ip;
-					memcpy( op, ipd, 16 );
+					lzav_memcpy( op, ipd, 16 );
 					op += cc;
 					goto _refblk; // Reference block follows, if not EOS.
 				}
@@ -1836,10 +2052,10 @@ static inline int32_t lzav_decompress_2( const void* const src, void* const dst,
 
 				if( LZAV_LIKELY(( op < opet ) & ( ipd < ipe - 63 - 16 )))
 				{
-					memcpy( op, ipd, 16 );
-					memcpy( op + 16, ipd + 16, 16 );
-					memcpy( op + 32, ipd + 32, 16 );
-					memcpy( op + 48, ipd + 48, 16 );
+					lzav_memcpy( op, ipd, 16 );
+					lzav_memcpy( op + 16, ipd + 16, 16 );
+					lzav_memcpy( op + 32, ipd + 32, 16 );
+					lzav_memcpy( op + 48, ipd + 48, 16 );
 
 					if( LZAV_LIKELY( cc < 65 ))
 					{
@@ -1875,7 +2091,7 @@ static inline int32_t lzav_decompress_2( const void* const src, void* const dst,
 			}
 
 			// This and other alike copy-blocks are transformed into fast SIMD
-			// instructions, by a modern compiler. Direct use of `memcpy` is
+			// instructions, by a modern compiler. Direct use of `lzav_memcpy` is
 			// slower due to shortness of data remaining to copy, on average.
 
 			while( cc != 0 )
@@ -1893,18 +2109,18 @@ static inline int32_t lzav_decompress_2( const void* const src, void* const dst,
 
 			if( op + cc < ope )
 			{
-				memcpy( op, ipd, cc );
+				lzav_memcpy( op, ipd, cc );
 				*pwl = (int32_t) ( op + cc - (uint8_t*) dst );
 			}
 			else
 			{
-				memcpy( op, ipd, ope - op );
+				lzav_memcpy( op, ipd, ope - op );
 			}
 
 			return LZAV_E_SRCOOB;
 
 		_err_dstoob_lit:
-			memcpy( op, ipd, ope - op );
+			lzav_memcpy( op, ipd, ope - op );
 			return LZAV_E_DSTOOB;
 		}
 
@@ -1992,7 +2208,7 @@ static inline int32_t lzav_decompress_2( const void* const src, void* const dst,
 		continue;
 
 	_err_dstoob_ref:
-		memmove( op, ipd, ope - op );
+		lzav_memmove( op, ipd, ope - op );
 		return LZAV_E_DSTOOB;
 	}
 
@@ -2078,7 +2294,7 @@ static inline int32_t lzav_decompress_1( const void* const src, void* const dst,
 				if( LZAV_LIKELY(( op < opet ) & ( ipd < ipe - 15 - 6 )))
 				{
 					bh = *ip;
-					memcpy( op, ipd, 16 );
+					lzav_memcpy( op, ipd, 16 );
 					op += cc;
 					goto _refblk; // Reference block follows, if not EOS.
 				}
@@ -2099,10 +2315,10 @@ static inline int32_t lzav_decompress_1( const void* const src, void* const dst,
 
 				if( LZAV_LIKELY(( op < opet ) & ( ipd < ipe - 63 - 1 )))
 				{
-					memcpy( op, ipd, 16 );
-					memcpy( op + 16, ipd + 16, 16 );
-					memcpy( op + 32, ipd + 32, 16 );
-					memcpy( op + 48, ipd + 48, 16 );
+					lzav_memcpy( op, ipd, 16 );
+					lzav_memcpy( op + 16, ipd + 16, 16 );
+					lzav_memcpy( op + 32, ipd + 32, 16 );
+					lzav_memcpy( op + 48, ipd + 48, 16 );
 
 					if( LZAV_LIKELY( cc < 65 ))
 					{
@@ -2133,7 +2349,7 @@ static inline int32_t lzav_decompress_1( const void* const src, void* const dst,
 			}
 
 			// This and other alike copy-blocks are transformed into fast SIMD
-			// instructions, by a modern compiler. Direct use of `memcpy` is
+			// instructions, by a modern compiler. Direct use of `lzav_memcpy` is
 			// slower due to shortness of data remaining to copy, on average.
 
 			while( cc != 0 )
@@ -2339,7 +2555,7 @@ static inline int32_t lzav_decompress(const void* const src, void* const dst,
     if (srcl <= LZAV_TINY_MAX + 2 && ip[0] >> 4 == LZAV_FMT_CUR) {
         const int len = ip[1];
         if (len <= LZAV_TINY_MAX && len <= dstl) {
-            memcpy(dst, ip + 2, len);
+            lzav_memcpy(dst, ip + 2, len);
             return len;
         }
     }
